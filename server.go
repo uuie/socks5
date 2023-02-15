@@ -2,6 +2,7 @@ package socks5
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"log"
@@ -19,12 +20,14 @@ type Server struct {
 	AuthUsernamePasswordCallback         func(conn *Conn, username, password []byte) error
 	connectHandlers                      []ConnectHandler
 	closeHandlers                        []CloseHandler
+	DnsList                              []string
 }
 
 type Conn struct {
-	server *Server
-	rwc    net.Conn
-	Data   interface{}
+	server  *Server
+	rwc     net.Conn
+	Data    interface{}
+	dnslist []string
 }
 
 func New() *Server {
@@ -87,8 +90,9 @@ func (srv *Server) ListenAndServe(addr string) error {
 
 func (srv *Server) newConn(c net.Conn) (*Conn, error) {
 	conn := &Conn{
-		server: srv,
-		rwc:    c,
+		server:  srv,
+		rwc:     c,
+		dnslist: srv.DnsList,
 	}
 	return conn, nil
 }
@@ -179,8 +183,29 @@ func (c *Conn) commandConnect(cmd *cmd) error {
 			}
 		}
 	}
+	var conn net.Conn
+	if c.dnslist != nil && len(c.dnslist) > 0 {
+		var dialer = net.Dialer{
+			Resolver: &net.Resolver{
+				PreferGo: true,
+				Dial: func(ctx context.Context, network, address string) (conn net.Conn, err error) {
+					d := net.Dialer{
+						Timeout: time.Duration(5000) * time.Millisecond,
+					}
+					for _, s := range c.dnslist {
+						if conn, err = d.DialContext(ctx, "udp", s); err == nil {
+							break
+						}
+					}
+					return
+				},
+			},
+		}
+		conn, err = dialer.Dial("tcp", to)
+	} else {
+		conn, err = net.Dial("tcp", to)
+	}
 
-	conn, err := net.Dial("tcp", to)
 	if err != nil {
 		switch e := err.(type) {
 		case *net.OpError:
