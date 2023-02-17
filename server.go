@@ -10,6 +10,7 @@ import (
 	"os"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -28,6 +29,11 @@ type Conn struct {
 	rwc     net.Conn
 	Data    interface{}
 	dnslist []string
+}
+
+type OrderedResolver struct {
+	*net.Resolver
+	Order int
 }
 
 func New() *Server {
@@ -185,21 +191,55 @@ func (c *Conn) commandConnect(cmd *cmd) error {
 	}
 	var conn net.Conn
 	if c.dnslist != nil && len(c.dnslist) > 0 {
-		var dialer = net.Dialer{
-			Resolver: &net.Resolver{
-				PreferGo: true,
-				Dial: func(ctx context.Context, network, address string) (conn net.Conn, err error) {
-					d := net.Dialer{
-						Timeout: time.Duration(5000) * time.Millisecond,
-					}
-					for _, s := range c.dnslist {
-						if conn, err = d.DialContext(ctx, "udp", s); err == nil {
-							break
+		// test dns server top-down
+		// var resolver *net.Resolver
+		ch := make(chan *OrderedResolver, len(c.dnslist))
+		for i, s := range c.dnslist {
+			// server := s
+			go func(server string, order int) {
+				resolver := &OrderedResolver{
+					Resolver: &net.Resolver{
+						PreferGo: true,
+						Dial: func(ctx context.Context, network, address string) (conn net.Conn, err error) {
+							d := net.Dialer{
+								Timeout: time.Duration(1000) * time.Millisecond,
+							}
+							return d.DialContext(ctx, "udp", server)
+						}},
+					Order: order,
+				}
+				host := to[0:strings.LastIndex(to, ":")]
+				if addr, err := resolver.LookupHost(context.Background(), host); err == nil {
+					// fmt.Printf("\n========= addresses %v, order %v\n", addr, order)
+					for _, a := range addr {
+						if ip := net.ParseIP(a); ip.To4() != nil {
+							// fmt.Printf("============ sent resolver, order %v, address %s\n", order, a)
+							ch <- resolver
+							return
 						}
 					}
-					return
-				},
-			},
+					ch <- nil
+					// fmt.Printf("============ sent nil resolver, order %v\n", resolver.Order)
+				} else {
+					// fmt.Printf("============ sent nil resolver, order %v\n", resolver.Order)
+					ch <- nil
+				}
+			}(s, i)
+		}
+		var resolver *OrderedResolver
+		for i := 0; i < len(c.dnslist); i++ {
+			r := <-ch
+			// fmt.Printf("********got resolver, order %v\n", r)
+			if resolver == nil {
+				resolver = r
+			} else if r != nil && r.Order < resolver.Order {
+				resolver = r
+			}
+		}
+		// fmt.Printf("Start dialing... with resolver %v\n", resolver.Order)
+
+		dialer := net.Dialer{
+			Resolver: resolver.Resolver,
 		}
 		conn, err = dialer.Dial("tcp", to)
 	} else {
