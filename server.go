@@ -2,7 +2,6 @@ package socks5
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"io"
 	"log"
@@ -10,7 +9,6 @@ import (
 	"os"
 	"runtime"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 )
@@ -21,19 +19,13 @@ type Server struct {
 	AuthUsernamePasswordCallback         func(conn *Conn, username, password []byte) error
 	connectHandlers                      []ConnectHandler
 	closeHandlers                        []CloseHandler
-	DnsList                              []string
+	CustomizedDialer                     func(to string) *net.Dialer
 }
 
 type Conn struct {
-	server  *Server
-	rwc     net.Conn
-	Data    interface{}
-	dnslist []string
-}
-
-type OrderedResolver struct {
-	*net.Resolver
-	Order int
+	server *Server
+	rwc    net.Conn
+	Data   interface{}
 }
 
 func New() *Server {
@@ -96,9 +88,8 @@ func (srv *Server) ListenAndServe(addr string) error {
 
 func (srv *Server) newConn(c net.Conn) (*Conn, error) {
 	conn := &Conn{
-		server:  srv,
-		rwc:     c,
-		dnslist: srv.DnsList,
+		server: srv,
+		rwc:    c,
 	}
 	return conn, nil
 }
@@ -190,57 +181,11 @@ func (c *Conn) commandConnect(cmd *cmd) error {
 		}
 	}
 	var conn net.Conn
-	if c.dnslist != nil && len(c.dnslist) > 0 {
-		// test dns server top-down
-		// var resolver *net.Resolver
-		ch := make(chan *OrderedResolver, len(c.dnslist))
-		for i, s := range c.dnslist {
-			// server := s
-			go func(server string, order int) {
-				resolver := &OrderedResolver{
-					Resolver: &net.Resolver{
-						PreferGo: true,
-						Dial: func(ctx context.Context, network, address string) (conn net.Conn, err error) {
-							d := net.Dialer{
-								Timeout: time.Duration(1000) * time.Millisecond,
-							}
-							return d.DialContext(ctx, "udp", server)
-						}},
-					Order: order,
-				}
-				host := to[0:strings.LastIndex(to, ":")]
-				if addr, err := resolver.LookupHost(context.Background(), host); err == nil {
-					// fmt.Printf("\n========= addresses %v, order %v\n", addr, order)
-					for _, a := range addr {
-						if ip := net.ParseIP(a); ip.To4() != nil {
-							// fmt.Printf("============ sent resolver, order %v, address %s\n", order, a)
-							ch <- resolver
-							return
-						}
-					}
-					ch <- nil
-					// fmt.Printf("============ sent nil resolver, order %v\n", resolver.Order)
-				} else {
-					// fmt.Printf("============ sent nil resolver, order %v\n", resolver.Order)
-					ch <- nil
-				}
-			}(s, i)
-		}
-		var resolver *OrderedResolver
-		for i := 0; i < len(c.dnslist); i++ {
-			r := <-ch
-			// fmt.Printf("********got resolver, order %v\n", r)
-			if resolver == nil {
-				resolver = r
-			} else if r != nil && r.Order < resolver.Order {
-				resolver = r
-			}
-		}
-		// fmt.Printf("Start dialing... with resolver %v\n", resolver.Order)
-
-		dialer := net.Dialer{
-			Resolver: resolver.Resolver,
-		}
+	var dialer *net.Dialer
+	if c.server.CustomizedDialer != nil {
+		dialer = c.server.CustomizedDialer(to)
+	}
+	if dialer != nil {
 		conn, err = dialer.Dial("tcp", to)
 	} else {
 		conn, err = net.Dial("tcp", to)
@@ -343,7 +288,7 @@ func (c *Conn) command() error {
 func (c *Conn) serve() {
 	defer func() {
 		if err := recover(); err != nil {
-			const size = 4096
+			const size = 16384
 			buf := make([]byte, size)
 			buf = buf[:runtime.Stack(buf, false)]
 			c.server.Logger.Printf("socks5: panic serving %v: %v\n%s", c.rwc.RemoteAddr(), err, buf)
